@@ -35,6 +35,9 @@ class Server:
     source: ServerSource = ServerSource.MANUAL
     enabled: bool = True
     identity_file: Optional[str] = None  # optional SSH key path (from ssh config), never a secret itself
+    # Optional ProxyJump spec, e.g. "user@bastion:22,hop2". Same syntax as ssh_config.
+    # For SSH_CONFIG servers this is resolved live from ~/.ssh/config at connect time.
+    proxy_jump: Optional[str] = None
 
     def display_label(self) -> str:
         """Human readable label used in the server dropdown / manager."""
@@ -46,13 +49,18 @@ class Server:
         Only used for MANUAL servers; SSH_CONFIG servers are never
         persisted by the application (they live in the user's ssh config).
         """
-        return {
+        data = {
             "name": self.name,
             "hostname": self.hostname,
             "username": self.username,
             "port": self.port,
             "enabled": self.enabled,
         }
+        if self.identity_file:
+            data["identity_file"] = self.identity_file
+        if self.proxy_jump:
+            data["proxy_jump"] = self.proxy_jump
+        return data
 
     @staticmethod
     def from_dict(data: dict, source: ServerSource = ServerSource.MANUAL) -> "Server":
@@ -77,6 +85,8 @@ class Server:
             port=port,
             source=source,
             enabled=bool(data.get("enabled", True)),
+            identity_file=(str(data["identity_file"]).strip() or None) if data.get("identity_file") else None,
+            proxy_jump=(str(data["proxy_jump"]).strip() or None) if data.get("proxy_jump") else None,
         )
 
 

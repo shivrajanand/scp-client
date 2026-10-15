@@ -9,11 +9,12 @@ the activity log.
 from __future__ import annotations
 
 import logging
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QEvent, QFileSystemWatcher, QMetaObject, QThread, QTimer, Qt, Slot
 from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
@@ -43,7 +44,7 @@ from app.gui.remote_browser import RemoteBrowserDialog
 from app.gui.server_manager import ServerManagerDialog
 from app.gui.styles import stylesheet_for_theme
 from app.ssh.config_loader import load_ssh_config_servers
-from app.ssh.connection import SSHConnection
+from app.ssh.connection import DEFAULT_SSH_CONFIG, SSHConnection
 from app.ssh.host_keys import trust_host_key
 from app.transfer.progress import format_bytes, format_eta, format_speed
 from app.transfer.worker import TransferWorker, run_transfer_in_thread
@@ -62,16 +63,95 @@ class MainWindow(QMainWindow):
         self.preferences: AppPreferences = self.config_manager.load_preferences()
         self.manual_servers: List[Server] = self.config_manager.load_servers()
         self.ssh_config_servers: List[Server] = load_ssh_config_servers()
+        self._ssh_config_signature = self._ssh_config_stat()
 
         self.direction: TransferDirection = TransferDirection.UPLOAD
         self._active_thread = None
         self._active_worker: Optional[TransferWorker] = None
         self._browsed_connection: Optional[SSHConnection] = None
 
+        # Jump-host passwords for the current operation only (memory only,
+        # cleared as soon as the connection / transfer is done).
+        self._jump_password_cache: dict = {}
+        # Lets worker threads run GUI code (dialogs) safely on the GUI thread.
+        self._gui_call_lock = threading.Lock()
+        self._gui_call_fn = None
+        self._gui_call_result = None
+        self._gui_call_error = None
+
         self._build_ui()
         self._apply_theme(self.preferences.theme)
         self._refresh_server_dropdown()
         self._on_direction_changed(TransferDirection.UPLOAD)
+        self._setup_ssh_config_watcher()
+
+    # ------------------------------------------------------------------
+    # ~/.ssh/config live reload
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _ssh_config_stat():
+        """(mtime_ns, size) of the ssh config, or None if it doesn't exist."""
+        try:
+            st = DEFAULT_SSH_CONFIG.stat()
+            return (st.st_mtime_ns, st.st_size)
+        except OSError:
+            return None
+
+    def _setup_ssh_config_watcher(self) -> None:
+        self._ssh_watch_timer = QTimer(self)
+        self._ssh_watch_timer.setSingleShot(True)
+        self._ssh_watch_timer.setInterval(300)  # debounce: editors fire several events per save
+        self._ssh_watch_timer.timeout.connect(lambda: self._reload_ssh_config_servers(log=True))
+
+        self._ssh_watcher = QFileSystemWatcher(self)
+        self._ssh_watcher.fileChanged.connect(self._on_ssh_config_fs_event)
+        self._ssh_watcher.directoryChanged.connect(self._on_ssh_config_fs_event)
+        self._rearm_ssh_watcher()
+
+    def _rearm_ssh_watcher(self) -> None:
+        # Many editors save by replacing the file, which silently drops the
+        # watch; so re-add the file (and its folder) after every event.
+        wanted = [str(DEFAULT_SSH_CONFIG), str(DEFAULT_SSH_CONFIG.parent)]
+        current = set(self._ssh_watcher.files()) | set(self._ssh_watcher.directories())
+        for path in wanted:
+            if path not in current and Path(path).exists():
+                self._ssh_watcher.addPath(path)
+
+    def _on_ssh_config_fs_event(self, _path: str) -> None:
+        self._rearm_ssh_watcher()
+        self._ssh_watch_timer.start()
+
+    def _reload_ssh_config_servers(self, log: bool = False) -> bool:
+        """Re-read ~/.ssh/config if it changed. Returns True if the list was reloaded.
+
+        Keeps the user's current selection and any paths they've typed.
+        """
+        signature = self._ssh_config_stat()
+        if signature == self._ssh_config_signature:
+            return False
+        self._ssh_config_signature = signature
+
+        try:
+            self.ssh_config_servers = load_ssh_config_servers()
+        except Exception as exc:
+            logger.warning("Could not reload ssh config: %s", exc)
+            return False
+
+        source_text = self.source_edit.text()
+        destination_text = self.destination_edit.text()
+        self._refresh_server_dropdown()
+        self.source_edit.setText(source_text)
+        self.destination_edit.setText(destination_text)
+
+        if log:
+            self._log("SSH config changed - server list reloaded")
+        return True
+
+    def changeEvent(self, event) -> None:
+        # Safety net in case the file watcher missed something (network drives etc.).
+        if event.type() == QEvent.Type.ActivationChange and self.isActiveWindow():
+            self._reload_ssh_config_servers(log=True)
+        super().changeEvent(event)
 
     # ------------------------------------------------------------------
     # UI construction
@@ -343,19 +423,98 @@ class MainWindow(QMainWindow):
         browser.selected_file_path = browser.current_path
         browser.accept()
 
+    # --- running GUI code from worker threads ------------------------
+    @Slot()
+    def _run_gui_call(self) -> None:
+        try:
+            self._gui_call_result = self._gui_call_fn()
+        except BaseException as exc:  # handed back to the calling thread
+            self._gui_call_error = exc
+
+    def _call_in_gui(self, fn):
+        """Run fn() on the GUI thread and return its result (safe from any thread)."""
+        if QThread.currentThread() == self.thread():
+            return fn()
+        with self._gui_call_lock:
+            self._gui_call_fn = fn
+            self._gui_call_result = None
+            self._gui_call_error = None
+            QMetaObject.invokeMethod(
+                self, "_run_gui_call", Qt.ConnectionType.BlockingQueuedConnection
+            )
+            error, result = self._gui_call_error, self._gui_call_result
+            self._gui_call_fn = None
+        if error is not None:
+            raise error
+        return result
+
+    # --- jump host passwords ------------------------------------------
+    def _jump_password_provider(self, username: str, hostname: str, port: int) -> Optional[str]:
+        """Called by SSHConnection (possibly from the worker thread) when a jump host needs a password."""
+        key = (username, hostname, port)
+        if key in self._jump_password_cache:
+            return self._jump_password_cache[key]
+
+        def ask():
+            return PasswordDialog.prompt(f"{hostname} (jump host)", username, hostname, self)
+
+        password = self._call_in_gui(ask)
+        if password is not None:
+            self._jump_password_cache[key] = password
+        return password
+
+    def _collect_jump_passwords(self, server: Server) -> bool:
+        """Ask for jump-host passwords BEFORE the target's, in hop order.
+
+        Hops that have an IdentityFile configured are skipped (key auth is
+        tried first anyway). Returns False if the user cancelled.
+        """
+        try:
+            hops = SSHConnection(server).jump_hops()
+        except Exception as exc:
+            QMessageBox.critical(self, "ProxyJump", f"Invalid ProxyJump configuration:\n\n{exc}")
+            return False
+        for hop in hops:
+            key = (hop.username, hop.hostname, hop.port)
+            if hop.has_key or key in self._jump_password_cache:
+                continue
+            password = PasswordDialog.prompt(
+                f"{hop.label} (jump host)", hop.username, hop.hostname, self
+            )
+            if password is None:
+                self._clear_jump_passwords()
+                return False
+            self._jump_password_cache[key] = password
+        return True
+
+    def _clear_jump_passwords(self) -> None:
+        self._jump_password_cache.clear()
+        SSHConnection.default_jump_password_provider = None
+
     def _connect_with_prompt(self, server: Server) -> Optional[SSHConnection]:
+        if self._reload_ssh_config_servers(log=True):
+            server = self._current_server() or server  # pick up edited settings
+
+        # Jump host(s) first, then the target - same order the connection happens in.
+        if not self._collect_jump_passwords(server):
+            return None
         password = PasswordDialog.prompt(server.name, server.username, server.hostname, self)
         if password is None:
+            self._clear_jump_passwords()
             return None
 
         connection = SSHConnection(server)
         try:
-            self._log(f"Connecting to {server.hostname}:{server.port}")
+            self._log(f"Connecting to {connection.describe_route()}")
 
             def on_new_key(hostname, key_type, fingerprint, changed):
                 return self._prompt_host_key_trust(hostname, key_type, fingerprint, changed, connection)
 
-            connection.connect(password=password, allow_new_host_key=on_new_key)
+            connection.connect(
+                password=password,
+                allow_new_host_key=on_new_key,
+                jump_password_provider=self._jump_password_provider,
+            )
             self._log("Authentication successful")
             return connection
         except Exception as exc:
@@ -363,8 +522,14 @@ class MainWindow(QMainWindow):
             return None
         finally:
             password = None
+            self._clear_jump_passwords()
 
     def _prompt_host_key_trust(self, hostname, key_type, fingerprint, changed, connection) -> bool:
+        return self._call_in_gui(
+            lambda: self._prompt_host_key_trust_gui(hostname, key_type, fingerprint, changed)
+        )
+
+    def _prompt_host_key_trust_gui(self, hostname, key_type, fingerprint, changed) -> bool:
         if changed:
             text = (
                 f"WARNING: The host key for {hostname} has CHANGED.\n\n"
@@ -424,6 +589,7 @@ class MainWindow(QMainWindow):
         return None
 
     def _on_transfer_clicked(self) -> None:
+        self._reload_ssh_config_servers(log=True)
         error = self._validate_transfer()
         if error:
             QMessageBox.warning(self, "Cannot Transfer", error)
@@ -445,9 +611,19 @@ class MainWindow(QMainWindow):
             destination_path=destination,
         )
 
+        server = self._current_server() or server
+        request.server = server
+
+        if not self._collect_jump_passwords(server):
+            return
         password = PasswordDialog.prompt(server.name, server.username, server.hostname, self)
         if password is None:
+            self._clear_jump_passwords()
             return
+
+        # The transfer worker builds its own SSHConnection; this hook lets it
+        # ask for jump-host passwords (cleared again when the transfer ends).
+        SSHConnection.default_jump_password_provider = self._jump_password_provider
 
         def host_key_decision(hostname, key_type, fingerprint, changed) -> bool:
             return self._prompt_host_key_trust(hostname, key_type, fingerprint, changed, None)
@@ -512,6 +688,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Transfer cancelled")
 
     def _on_thread_finished(self) -> None:
+        self._clear_jump_passwords()
         self._set_transfer_in_progress(False)
         self._active_thread = None
         self._active_worker = None
